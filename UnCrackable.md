@@ -217,6 +217,163 @@ the `local_40` stack variable:
 
 The assembled string is `Thanks for all the fish`, which is sucessful.
 
+## Level 3
+
+This challenge looks similar to the previous and again loads a native `libfoo.so`
+library. This time, however, the app performs some verification checks on the
+imported libraries, ensuring that the libs are valid and not swapped with a
+different shared library to solve the problem. 
+
+```java
+    private void verifyLibs() {
+        this.crc = new HashMap();
+        this.crc.put("armeabi-v7a", Long.valueOf(Long.parseLong(getResources().getString(owasp.mstg.uncrackable3.R.string.armeabi_v7a))));
+        this.crc.put("arm64-v8a", Long.valueOf(Long.parseLong(getResources().getString(owasp.mstg.uncrackable3.R.string.arm64_v8a))));
+        this.crc.put("x86", Long.valueOf(Long.parseLong(getResources().getString(owasp.mstg.uncrackable3.R.string.x86))));
+        this.crc.put("x86_64", Long.valueOf(Long.parseLong(getResources().getString(owasp.mstg.uncrackable3.R.string.x86_64))));
+        try {
+            ZipFile zipFile = new ZipFile(getPackageCodePath());
+            for (Map.Entry<String, Long> entry : this.crc.entrySet()) {
+                String str = "lib/" + entry.getKey() + "/libfoo.so";
+                ZipEntry entry2 = zipFile.getEntry(str);
+                Log.v(TAG, "CRC[" + str + "] = " + entry2.getCrc());
+                if (entry2.getCrc() != entry.getValue().longValue()) {
+                    tampered = 31337;
+                    Log.v(TAG, str + ": Invalid checksum = " + entry2.getCrc() + ", supposed to be " + entry.getValue());
+                }
+            }
+            ZipEntry entry3 = zipFile.getEntry("classes.dex");
+            Log.v(TAG, "CRC[classes.dex] = " + entry3.getCrc());
+            if (entry3.getCrc() != baz()) {
+                tampered = 31337;
+                Log.v(TAG, "classes.dex: crc = " + entry3.getCrc() + ", supposed to be " + baz());
+            }
+        } catch (IOException unused) {
+            Log.v(TAG, "Exception");
+            System.exit(0);
+        }
+    }
+```
+Assuming the libraries are used as intended, this is not a problem. The
+calculated CRCs will match the value returned from native `baz` function call:
+
+```c
+long Java_sg_vantagepoint_uncrackable3_MainActivity_baz(void)
+
+{
+  return 0x18110e3;
+}
+```
+
+After `onCreate` calls this function, it again calls `init` from the native.
+But this time, the function takes in bytes from the class's `xorkey` string,
+set to `"pizzapizzapizzapizzapizz"`. Reversing in Ghidra shows the native
+function convert the bytes to a `char[]` and copy into a global buffer. It also
+increments a global `state` variable used later.
+
+```c
+void Java_sg_vantagepoint_uncrackable3_MainActivity_init(u_char *param_1)
+
+{
+  char *xor_key;
+
+  FUN_0010323c();
+  xor_key = (char *)(**(code **)(*(long *)param_1 + 0x5c0))(param_1);
+  strncpy(_xor_key,xor_key,0x18);
+  (**(code **)(*(long *)param_1 + 0x600))(param_1);
+  state = state + 1;
+  return;
+}
+```
+
+Finally, the `onCreate` function initializes `this.check = new CodeCheck();`,
+creating a new `CodeCheck` class and storing it as a class member variable.
+
+Once initialization is complete, the `verify` method again uses a native C
+function to perform the verification. This time, the checking function,
+`code_check`, is a `CodeCheck` class member accessed through `this`.
+
+```java
+    public boolean check_code(String str) {
+        return bar(str.getBytes());
+    }
+```
+
+The `bool Java_sg_vantagepoint_uncrackable3_CodeCheck_bar(u_char *input)`
+function intialized 0x18 bytes on the stack for cipher text, assigned in a
+subfunction call:
+
+```c
+...
+  ciphertext._0_8_ = 0;
+  ciphertext._8_8_ = 0;
+  ciphertext._16_8_ = 0;
+  if (state == 2) {
+    create_linked_list(ciphertext);
+```
+
+The `create_linked_list` function creates a lot of nodes that appear in memory
+like:
+
+```c
+struct node {
+    uint32_t key;
+    node* next;
+};
+```
+
+This is largely irrelevant; the function performs a number of these operations
+and finally checks that at least one node was allocated and stored into the
+global variable `_1_sub_doit__opaque_list1_1`. So long as that occurs, the
+function sets the value of `ciphertext` since it was passed by reference:
+
+
+```c
+...
+  if (_1_sub_doit__opaque_list1_1 != (node *)0x0) {
+    *ciphertext = 0;
+    ciphertext[1] = 0;
+    ciphertext[2] = 0;
+    *(undefined *)(ciphertext + 3) = 0;
+    ciphertext[1] = 0x15131d5a1903000d;
+    *ciphertext = 0x1549170f1311081d;
+    ciphertext[2] = 0x14130817005a0e08;
+  }
+  return;
+}
+```
+
+The validating `bar` function first ensures that the input string length (from
+the app) is 0x18 in length, otherwise it aborts. It then performs a bitwise
+xor over the ciphertext using the provided key from the Java application.
+Success occurs if each byte of the input matches the decrypted output:
+
+
+```c
+    input_str = (char *)(**(code **)(*(long *)input + 0x5c0))(input);
+    len_str = (**(code **)(*(long *)input + 0x558))(input);
+    if (len_str == 0x18) {
+      counter = 0;
+      do {
+        if (input_str[counter] != (char)(_xor_key[counter] ^ ciphertext[counter])) goto fail;
+        counter = counter + 1;
+      } while (counter < 0x18);
+      if ((int)counter == 0x18) {
+        retval = true;
+        goto stack_check;
+      }
+```
+
+The [UnCrackable-level3.py](/scripts/UnCrackable-level3.py) script performs
+this decryption and reveals the key. One thing to be mindful of is endianness;
+these shared libraries are little-endian, meaning each byte has its least
+significant value first when retrieved from memory. Iteration through the key
+should be done linearly, and every qword shown in the ciphertext decompilation
+should be reversed when performing the decryption.
+
+The result is an intelligible string that solves the challenge `making owasp
+great again`. 
+
 ### Other Tips
 
 Connect to an emulated device using `adb`:
