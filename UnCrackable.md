@@ -374,6 +374,89 @@ should be reversed when performing the decryption.
 The result is an intelligible string that solves the challenge `making owasp
 great again`. 
 
+## Level 4
+
+This app is much different than the others and contains two different versions
+of the r2pay app (v0.9 and v1.0). Loading version 1.0 into jadx shows a stripped
+down `onCreate` method that, as the prevoius apps have, checks for super user
+privileges and basic library information. Note that this app does not contain a
+x86 shared library, and thus any attempts to emulate on an x86 emualtor fail.
+Intead, an x86_64 emulator from the Play Store can run the app with no issues:
+
+![r2 pay app](/images/radare2_pay.png)
+
+Most of the meat for this challenge resides in the `onClick` callback for the
+submit button. Quick reversing shows that the pin number entered must be 4
+digits and the amount must be less than or equal to 8 bytes. If both conditions
+hold, the two strings are concatenated and passed to a native library function
+in the `libnative-lib.so` shared library.
+
+Unfortunately, this library is statically linked so it contains no easy
+`Java_...` function names which map with the class pasth in the Java code.
+Instead, the library binds the function names to functions using the JNI
+`RegisterNatives` command. The easiest way to locate this is to search for the
+function name or Java signature. Unfortunately, the library strings appear to be
+encrypted; the function name does not exist, and the strings present in the
+shared library are relatively sparse.
+
+One option is to start reversing the `JNI_OnLoad` function, which is triggered
+upon library load, however scanning through function names shows a number of
+`decode` functions. Only two of these are meaningful (others simple return),
+specifically `.datadiv_decode16323044921667855934`. 
+
+Reversing in Ghidra shows this function pulls a number of .bss strings and
+performs logical operations on them. This is likely decoding strings using
+hard-coded keys. [A simple Ghidra script](/scripts/UnCrackable-level4.py) can
+perform these operations and add comments to the binary for quicker reversing.
+Scanning the resulting list shows `gXftm3iswpkVgBNDUp`, the name of the native
+function called by the app! Following the xrefs of this string show a use in
+`JNI_OnLoad`. Knowing that it should be used in a call to `JNI_OnLoad`, the
+calling structure must be retrieved from the `JNIEnv` struct. JNI structures
+are known and defined, and this [Ghidra file archive](https://github.com/Ayrx/JNIAnalyzer/blob/c8e5fb79df025fbf0cc4ad1674a86c6536b3b005/JNIAnalyzer/data/jni_all.gdt)
+has all the types predefined for easy import. Casting the governing struct to
+`JNIEnv` shows a clear call to `RegisterNatives` with the function name used
+in the third parameter. 
+
+```c
+jVar4 = (*(**env)->RegisterNatives)(*env,*clazz,&methods,1);
+```
+
+This is because the third parameter is a
+`JNINativeMethod` struct, which includes the function name, signature,
+(which was also encoded), and the callback function address.
+
+```
+                     methods                                         XREF[1]:     JNI_OnLoad:0019b1ac(*)
+002b4018 30 41 2b        JNINativ
+         00 00 00
+         00 00 43
+   002b4018 30 41 2b 00 00  char *    gXftm3iswpkVgBNDUp      name          gXftm3iswpkVgBNDUp XREF[1]:     JNI_OnLoad:0019b1ac(*)
+            00 00 00
+   002b4020 43 41 2b 00 00  char *    signature               signature     = 84h
+            00 00 00
+   002b4028 1c b4 19 00 00  void *    FUN_0019b41c            fnPtr
+            00 00 00
+```
+
+Unfortunately the callback function, `FUN_0019b41c`, is...big. Ghidra cannot
+produce decompilation for it without hitting and error condition, however
+Binary Ninja is able to analyze it in full *(Note, Binja imports the binary with
+a base address of 0x0 whereas Ghirda uses `0x100000`. Rebase the Binja database
+to ensure both align*). The function is huge and performs a complicated series
+of logic operations. Jumping to the end of the function shows that it returns
+a byte array constructed from two calls to `SetByteArrayRegion`:
+
+```c
+001ede44      *byte_arr = (*p_env)->functions->NewByteArray(env: *p_env, len: 0x11)
+001ede7c      int32_t var_6368 = 0
+001ede80      int32_t var_636c = 1
+001ede4c      (*p_env)->functions->SetByteArrayRegion(env: *p_env, array: *byte_arr, start: 0, len: 1, buf: var_1af0)
+001ede8c      (*p_env)->functions->SetByteArrayRegion(env: *p_env, array: *byte_arr, start: 1, len: 0x10, buf: buf)
+```
+
+Following this further back, the buffer is set using data from a char array
+populated in function `0x20f6b4`.
+
 ### Other Tips
 
 Connect to an emulated device using `adb`:
